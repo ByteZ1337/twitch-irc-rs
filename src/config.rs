@@ -120,6 +120,8 @@ pub struct ClientConfig<L: LoginCredentials> {
     /// client. This means that all log output from a single client will all be under that span,
     /// with that name.
     pub tracing_identifier: Option<Cow<'static, str>>,
+
+    pub join_rate_limit: Option<(usize, Duration)>,
 }
 
 /// Used to configure the options around metrics collection using the `prometheus` crate.
@@ -181,6 +183,7 @@ impl<L: LoginCredentials> ClientConfig<L> {
             #[cfg(feature = "metrics-collection")]
             metrics_config: MetricsConfig::default(),
             tracing_identifier: None,
+            join_rate_limit: None,
         }
     }
 }

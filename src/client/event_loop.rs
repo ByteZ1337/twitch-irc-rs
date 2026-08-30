@@ -14,7 +14,9 @@ use crate::metrics::MetricsBundle;
 use crate::transport::Transport;
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::MissedTickBehavior;
 use tracing::{Instrument, info_span};
 
 #[derive(Debug)]
@@ -61,6 +63,9 @@ pub(crate) struct ClientLoopWorker<T: Transport, L: LoginCredentials> {
     client_incoming_messages_tx: mpsc::UnboundedSender<ServerMessage>,
     #[cfg(feature = "metrics-collection")]
     metrics: Option<MetricsBundle>,
+    pending_joins: VecDeque<String>,
+    pending_set: HashSet<String>,
+    join_times: VecDeque<Instant>,
 }
 
 impl<T: Transport, L: LoginCredentials> ClientLoopWorker<T, L> {
@@ -87,6 +92,9 @@ impl<T: Transport, L: LoginCredentials> ClientLoopWorker<T, L> {
             client_incoming_messages_tx,
             #[cfg(feature = "metrics-collection")]
             metrics,
+            pending_joins: VecDeque::new(),
+            pending_set: HashSet::new(),
+            join_times: VecDeque::new(),
         };
 
         tokio::spawn(worker.run().instrument(span));
@@ -94,8 +102,16 @@ impl<T: Transport, L: LoginCredentials> ClientLoopWorker<T, L> {
 
     async fn run(mut self) {
         tracing::debug!("Spawned client event loop");
-        while let Some(command) = self.client_loop_rx.recv().await {
-            self.process_command(command);
+        let mut tick = tokio::time::interval(Duration::from_millis(100));
+        tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                cmd = self.client_loop_rx.recv() => match cmd {
+                    Some(cmd) => self.process_command(cmd),
+                    None => break,
+                },
+                _ = tick.tick() => self.drain_pending_joins(),
+            }
         }
         tracing::debug!("Client event loop ended");
     }
@@ -259,6 +275,45 @@ impl<T: Transport, L: LoginCredentials> ClientLoopWorker<T, L> {
             return;
         }
 
+        if self.pending_set.insert(channel_login.clone()) {
+            self.pending_joins.push_back(channel_login);
+        }
+    }
+
+    fn drain_pending_joins(&mut self) {
+        let Some((limit, window)) = self.config.join_rate_limit else {
+            while let Some(login) = self.pending_joins.pop_front() {
+                if self.pending_set.remove(&login) {
+                    self.dispatch_join(login);
+                }
+            }
+            return;
+        };
+
+        let now = Instant::now();
+        while self
+            .join_times
+            .front()
+            .is_some_and(|t| now.duration_since(*t) > window)
+        {
+            self.join_times.pop_front();
+        }
+        let mut popped = 0;
+        while self.join_times.len() < limit && popped < limit * 4 {
+            let Some(login) = self.pending_joins.pop_front() else {
+                break;
+            };
+            popped += 1;
+            if !self.pending_set.remove(&login) {
+                continue;
+            }
+            self.join_times.push_back(now);
+            self.dispatch_join(login);
+        }
+        self.update_metrics();
+    }
+
+    fn dispatch_join(&mut self, channel_login: String) {
         let mut pool_connection = self
             .connections
             .iter()
@@ -326,6 +381,7 @@ impl<T: Transport, L: LoginCredentials> ClientLoopWorker<T, L> {
     }
 
     fn part(&mut self, channel_login: String) {
+        self.pending_set.remove(&channel_login);
         // skip the PART altogether if the last message we sent regarding that channel was a PART
         // (or nothing at all, for that matter).
         if self
@@ -541,6 +597,10 @@ impl<T: Transport, L: LoginCredentials> ClientLoopWorker<T, L> {
                 .channels
                 .with_label_values(&["server"])
                 .set(num_server);
+            metrics
+                .channels
+                .with_label_values(&["pending"])
+                .set(self.pending_joins.len() as i64);
         }
     }
 
