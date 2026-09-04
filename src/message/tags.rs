@@ -116,10 +116,8 @@ impl AsRawIRC for IRCTags {
                 add_separator = true;
             }
             f.write_str(key)?;
-            if !value.is_empty() {
-                f.write_char('=')?;
-                f.write_str(&encode_tag_value(value))?;
-            }
+            f.write_char('=')?;
+            f.write_str(&encode_tag_value(value))?;
         }
 
         Ok(())

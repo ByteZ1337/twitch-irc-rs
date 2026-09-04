@@ -120,7 +120,8 @@ pub struct ClientConfig<L: LoginCredentials> {
     /// client. This means that all log output from a single client will all be under that span,
     /// with that name.
     pub tracing_identifier: Option<Cow<'static, str>>,
-
+    
+    /// Allows you to rate-limit the number of channels joined per time interval.
     pub join_rate_limit: Option<(usize, Duration)>,
 }
 
