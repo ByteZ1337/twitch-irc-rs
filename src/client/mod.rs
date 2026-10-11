@@ -1,6 +1,7 @@
 //! The chat client and its accompanying types.
 
 pub(crate) mod event_loop;
+mod join_tracker;
 mod pool_connection;
 
 use crate::client::event_loop::{ClientLoopCommand, ClientLoopWorker};
@@ -17,6 +18,7 @@ use crate::validate::validate_login;
 use crate::{irc, validate};
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 /// A send-only handle to control the Twitch IRC Client.
@@ -350,6 +352,22 @@ impl<T: Transport, L: LoginCredentials> TwitchIRCClient<T, L> {
         self.client_loop_tx
             .send(ClientLoopCommand::GetChannelStatus {
                 channel_login,
+                return_sender: return_tx,
+            })
+            .unwrap();
+        // unwrap: ClientLoopWorker should not die before all sender handles have been dropped
+        return_rx.await.unwrap()
+    }
+
+    /// Lists the wanted channels whose `JOIN` the server has left unanswered for at least `min_age`.
+    ///
+    /// Twitch does not reply to a `JOIN` for a login that no longer exists, so a channel that
+    /// stays in this list was most likely renamed, suspended or deleted.
+    pub async fn unconfirmed_channels(&self, min_age: Duration) -> Vec<String> {
+        let (return_tx, return_rx) = oneshot::channel();
+        self.client_loop_tx
+            .send(ClientLoopCommand::GetUnconfirmedChannels {
+                min_age,
                 return_sender: return_tx,
             })
             .unwrap();

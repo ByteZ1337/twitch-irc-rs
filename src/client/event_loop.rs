@@ -1,3 +1,4 @@
+use crate::client::join_tracker::JoinTracker;
 use crate::client::pool_connection::PoolConnection;
 #[cfg(feature = "metrics-collection")]
 use crate::client::pool_connection::ReportedConnectionState;
@@ -35,6 +36,10 @@ pub(crate) enum ClientLoopCommand<T: Transport, L: LoginCredentials> {
         channel_login: String,
         return_sender: oneshot::Sender<(bool, bool)>,
     },
+    GetUnconfirmedChannels {
+        min_age: Duration,
+        return_sender: oneshot::Sender<Vec<String>>,
+    },
     Part {
         channel_login: String,
     },
@@ -66,6 +71,7 @@ pub(crate) struct ClientLoopWorker<T: Transport, L: LoginCredentials> {
     pending_joins: VecDeque<String>,
     pending_set: HashSet<String>,
     join_times: VecDeque<Instant>,
+    joins: JoinTracker,
 }
 
 impl<T: Transport, L: LoginCredentials> ClientLoopWorker<T, L> {
@@ -95,6 +101,7 @@ impl<T: Transport, L: LoginCredentials> ClientLoopWorker<T, L> {
             pending_joins: VecDeque::new(),
             pending_set: HashSet::new(),
             join_times: VecDeque::new(),
+            joins: JoinTracker::default(),
         };
 
         tokio::spawn(worker.run().instrument(span));
@@ -138,6 +145,14 @@ impl<T: Transport, L: LoginCredentials> ClientLoopWorker<T, L> {
             } => {
                 return_sender
                     .send(self.get_channel_status(channel_login))
+                    .ok();
+            }
+            ClientLoopCommand::GetUnconfirmedChannels {
+                min_age,
+                return_sender,
+            } => {
+                return_sender
+                    .send(self.joins.unconfirmed_for(min_age, Instant::now()))
                     .ok();
             }
             ClientLoopCommand::Part { channel_login } => self.part(channel_login),
@@ -266,12 +281,8 @@ impl<T: Transport, L: LoginCredentials> ClientLoopWorker<T, L> {
     /// The client will make best attempts to stay joined to this channel. I/O errors will be
     /// compensated by retrying the join process. For this reason, this method returns no error.
     fn join(&mut self, channel_login: String) {
-        let channel_already_confirmed_joined = self.connections.iter().any(|c| {
-            c.wanted_channels.contains(&channel_login) && c.server_channels.contains(&channel_login)
-        });
-
         // skip the join altogether if we are already confirmed to be joined to that channel.
-        if channel_already_confirmed_joined {
+        if self.joins.is_confirmed(&channel_login) {
             return;
         }
 
@@ -343,6 +354,11 @@ impl<T: Transport, L: LoginCredentials> ClientLoopWorker<T, L> {
             .unwrap();
 
         pool_connection.register_sent_message();
+        if pool_connection.server_channels.contains(&channel_login) {
+            self.joins.confirm(&channel_login);
+        } else {
+            self.joins.unconfirm(&channel_login, Instant::now());
+        }
         pool_connection.wanted_channels.insert(channel_login);
 
         // put the connection back to the end of the queue
@@ -382,6 +398,7 @@ impl<T: Transport, L: LoginCredentials> ClientLoopWorker<T, L> {
 
     fn part(&mut self, channel_login: String) {
         self.pending_set.remove(&channel_login);
+        self.joins.forget(&channel_login);
         // skip the PART altogether if the last message we sent regarding that channel was a PART
         // (or nothing at all, for that matter).
         if self
@@ -469,6 +486,9 @@ impl<T: Transport, L: LoginCredentials> ClientLoopWorker<T, L> {
                             .find(|c| c.id == source_connection_id)
                             .unwrap();
                         c.server_channels.insert(channel_login.clone());
+                        if c.wanted_channels.contains(channel_login) {
+                            self.joins.confirm(channel_login);
+                        }
 
                         // update metrics about channel numbers
                         self.update_metrics();
@@ -481,6 +501,9 @@ impl<T: Transport, L: LoginCredentials> ClientLoopWorker<T, L> {
                             .find(|c| c.id == source_connection_id)
                             .unwrap();
                         c.server_channels.remove(channel_login);
+                        if c.wanted_channels.contains(channel_login) {
+                            self.joins.unconfirm(channel_login, Instant::now());
+                        }
 
                         // update metrics about channel numbers
                         self.update_metrics();
@@ -533,6 +556,7 @@ impl<T: Transport, L: LoginCredentials> ClientLoopWorker<T, L> {
                     pool_connection.wanted_channels
                 );
                 for channel in pool_connection.wanted_channels.drain() {
+                    self.joins.forget(&channel);
                     self.join(channel);
                 }
 
